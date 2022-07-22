@@ -1344,6 +1344,7 @@ func (js *jetStream) truncateOldPeers(mset *stream, newPreferred string) {
 		return
 	}
 
+	si, _ := js.srv.nodeToInfo.Load(newPreferred)
 	cc, csa := js.cluster, sa.copyGroup()
 	csa.Group.Peers = csa.Group.Peers[len(csa.Group.Peers)-csa.Config.Replicas:]
 	// Now do consumers still needing truncating first here, followed by the owning stream.
@@ -1351,13 +1352,12 @@ func (js *jetStream) truncateOldPeers(mset *stream, newPreferred string) {
 		if r := ca.Config.replicas(csa.Config); r != len(ca.Group.Peers) {
 			cca := ca.copyGroup()
 			cca.Group.Peers = cca.Group.Peers[len(cca.Group.Peers)-r:]
+			csa.Group.Cluster = si.(nodeInfo).cluster
 			cc.meta.ForwardProposal(encodeAddConsumerAssignment(cca))
 		}
 	}
 
-	si, _ := js.srv.nodeToInfo.Load(newPreferred)
 	csa.Group.Cluster = si.(nodeInfo).cluster
-
 	csa.Group.Preferred = newPreferred
 	cc.meta.ForwardProposal(encodeUpdateStreamAssignment(csa))
 }
@@ -3697,11 +3697,26 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 	var isLeader bool
 	recovering := true
 
+	scaledown := func(sd bool) {
+		n.(*raft).RWMutex.Lock()
+		n.(*raft).scaledown = sd
+		if sd {
+			n.(*raft).scaledownTime = time.Now()
+		} else {
+			n.(*raft).scaledownTime = time.Time{}
+		}
+		n.(*raft).RWMutex.Unlock()
+	}
+
+	defer func() { scaledown(false) }()
+
 	for {
 		select {
 		case <-s.quitCh:
+			fmt.Printf("qit %s %s\n", ca.Config.Durable, selfId)
 			return
 		case <-qch:
+			fmt.Printf("qit %s %s\n", ca.Config.Durable, selfId)
 			return
 		case <-aq.ch:
 			ces := aq.pop()
@@ -3727,6 +3742,17 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 			}
 			aq.recycle(&ces)
 		case isLeader = <-lch:
+			if ca.Config.Durable == "dur" {
+				peers := []string{}
+				ci := js.clusterInfo(o.raftGroup())
+				for _, r := range ci.Replicas {
+					peers = append(peers, fmt.Sprintf("{%v %v %v %v}", r.peer, r.Lag, r.Current, r.Active))
+				}
+				sort.Strings(peers)
+
+				fmt.Printf("ldr %s %s %s %t %t %+v\n%+v\n", ca.Config.Durable, selfId, n.GroupLeader(), isLeader, recovering, ca.Group.Peers, peers)
+			}
+
 			if recovering && !isLeader {
 				js.setConsumerAssignmentRecovering(ca)
 			}
@@ -3748,8 +3774,19 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 				stopMigrationMonitoring()
 			}
 		case <-uch:
+			if ca.Config.Durable == "dur" {
+
+				if len(ca.Group.Peers) == 6 && len(o.consumerAssignment().Group.Peers) == 3 {
+					scaledown(true)
+				}
+
+				fmt.Printf("uch %s %s %s %t %t %d %+v -> %+v / %+v\n",
+					ca.Config.Durable, selfId, n.GroupLeader(), isLeader, recovering, o.replica(),
+					ca.Group.Peers, &o.consumerAssignment().Group.Peers, o.raftGroup().Peers)
+			}
 			// keep consumer assignment current
 			ca = o.consumerAssignment()
+
 			// We get this when we have a new consumer assignment caused by an update.
 			// We want to know if we are migrating.
 			rg := o.raftGroup()
@@ -3780,6 +3817,12 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 
 			currentCount, firstPeer, foundLeader := currentPeerCount(ci, newPeerSet, selfId)
 
+			if ca.Config.Durable == "dur" {
+				fmt.Printf("tck %s %s %t (%d %d) %+v -> %+v %t %s\n",
+					ca.Config.Durable, selfId, isLeader, o.replica(), currentCount,
+					ca.Group.Peers, newPeerSet, foundLeader, firstPeer)
+			}
+
 			// If all are current we are good, or if we have some offline and we have a quorum.
 			if quorum := replicas/2 + 1; currentCount >= quorum {
 				// Remove the old peers or transfer leadership (after which new leader resumes with peer removal).
@@ -3788,10 +3831,14 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 				// In case these operations fail, the next tick will retry
 				if !foundLeader {
 					n.StepDown(firstPeer)
+					fmt.Printf("tck %s %s stepDown %s\n", ca.Config.Durable, selfId, firstPeer)
 				} else {
+					fmt.Printf("tck %s %s scaleDown %+v\n", ca.Config.Durable, selfId, newPeerSet)
+					scaledown(true)
 					// truncate this consumer
 					cca := ca.copyGroup()
 					cca.Group.Peers = newPeerSet
+					cca.Group.Cluster = s.ClusterName()
 					cc.meta.ForwardProposal(encodeAddConsumerAssignment(cca))
 				}
 			}

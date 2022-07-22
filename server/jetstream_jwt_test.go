@@ -358,11 +358,14 @@ func TestJetStreamJWTMove(t *testing.T) {
 		require_NoError(t, err)
 		require_Equal(t, ci.Cluster.Name, "C1")
 
-		sc.waitOnStreamLeader(aExpPub, "MOVE-ME")
+		fmt.Printf("--------\n")
 
-		checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
+		sc.clusterForName("C2").waitOnStreamLeader(aExpPub, "MOVE-ME")
+		//sc.clusterForName("C2").waitOnConsumerLeader(aExpPub, "MOVE-ME", "dur")
+
+		checkFor(t, 55*time.Second, 250*time.Millisecond, func() error {
 			if si, err := js.StreamInfo("MOVE-ME"); err != nil {
-				return err
+				return fmt.Errorf("stream error: %v", err)
 			} else if si.Cluster.Name != "C2" {
 				return fmt.Errorf("Wrong cluster: %q", si.Cluster.Name)
 			} else if !strings.HasPrefix(si.Cluster.Leader, "C2-") {
@@ -374,7 +377,7 @@ func TestJetStreamJWTMove(t *testing.T) {
 			}
 			// Now make sure consumer has leader etc..
 			if ci, err := js.ConsumerInfo("MOVE-ME", "dur"); err != nil {
-				return err
+				return fmt.Errorf("consumer error: %v", err)
 			} else if ci.Cluster.Name != "C2" {
 				return fmt.Errorf("Wrong cluster: %q", ci.Cluster.Name)
 			} else if ci.Cluster.Leader == _EMPTY_ {
@@ -389,21 +392,23 @@ func TestJetStreamJWTMove(t *testing.T) {
 		require_NoError(t, err)
 		require_NoError(t, m[0].AckSync())
 	}
+	/*
+		t.Run("tiered", func(t *testing.T) {
+			accClaim := jwt.NewAccountClaims(aExpPub)
+			accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
+				DiskStorage: 1100, Consumer: 1, Streams: 1}
+			accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{
+				DiskStorage: 3300, Consumer: 1, Streams: 1}
 
-	t.Run("tiered", func(t *testing.T) {
-		accClaim := jwt.NewAccountClaims(aExpPub)
-		accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
-			DiskStorage: 1100, Consumer: 1, Streams: 1}
-		accClaim.Limits.JetStreamTieredLimits["R3"] = jwt.JetStreamLimits{
-			DiskStorage: 3300, Consumer: 1, Streams: 1}
+			t.Run("R3", func(t *testing.T) {
+				test(t, 3, accClaim)
+			})
+			t.Run("R1", func(t *testing.T) {
+				test(t, 1, accClaim)
+			})
+		})
 
-		t.Run("R3", func(t *testing.T) {
-			test(t, 3, accClaim)
-		})
-		t.Run("R1", func(t *testing.T) {
-			test(t, 1, accClaim)
-		})
-	})
+	*/
 	t.Run("non-tiered", func(t *testing.T) {
 		accClaim := jwt.NewAccountClaims(aExpPub)
 		accClaim.Limits.JetStreamLimits = jwt.JetStreamLimits{
@@ -412,9 +417,13 @@ func TestJetStreamJWTMove(t *testing.T) {
 		t.Run("R3", func(t *testing.T) {
 			test(t, 3, accClaim)
 		})
-		t.Run("R1", func(t *testing.T) {
-			test(t, 1, accClaim)
-		})
+
+		/*
+			t.Run("R1", func(t *testing.T) {
+				test(t, 1, accClaim)
+			})
+
+		*/
 	})
 
 }

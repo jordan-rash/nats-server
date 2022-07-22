@@ -26,6 +26,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,42 +125,44 @@ func (state RaftState) String() string {
 
 type raft struct {
 	sync.RWMutex
-	created  time.Time
-	group    string
-	sd       string
-	id       string
-	wal      WAL
-	wtype    StorageType
-	track    bool
-	werr     error
-	state    RaftState
-	hh       hash.Hash64
-	snapfile string
-	csz      int
-	qn       int
-	peers    map[string]*lps
-	removed  map[string]string
-	acks     map[uint64]map[string]struct{}
-	pae      map[uint64]*appendEntry
-	elect    *time.Timer
-	active   time.Time
-	llqrt    time.Time
-	lsut     time.Time
-	term     uint64
-	pterm    uint64
-	pindex   uint64
-	commit   uint64
-	applied  uint64
-	leader   string
-	vote     string
-	hash     string
-	s        *Server
-	c        *client
-	js       *jetStream
-	dflag    bool
-	pleader  bool
-	observer bool
-	extSt    extensionState
+	created       time.Time
+	group         string
+	sd            string
+	id            string
+	wal           WAL
+	wtype         StorageType
+	track         bool
+	werr          error
+	state         RaftState
+	hh            hash.Hash64
+	snapfile      string
+	csz           int
+	qn            int
+	peers         map[string]*lps
+	removed       map[string]string
+	acks          map[uint64]map[string]struct{}
+	pae           map[uint64]*appendEntry
+	elect         *time.Timer
+	active        time.Time
+	llqrt         time.Time
+	lsut          time.Time
+	term          uint64
+	pterm         uint64
+	pindex        uint64
+	commit        uint64
+	applied       uint64
+	leader        string
+	vote          string
+	hash          string
+	s             *Server
+	c             *client
+	js            *jetStream
+	dflag         bool
+	pleader       bool
+	observer      bool
+	scaledown     bool
+	scaledownTime time.Time
+	extSt         extensionState
 
 	// Subjects for votes, updates, replays.
 	psubj  string
@@ -697,7 +701,7 @@ func (n *raft) doRemovePeerAsLeader(peer string) {
 	if _, ok := n.peers[peer]; ok {
 		delete(n.peers, peer)
 		// We should decrease our cluster size since we are tracking this peer and the peer is most likely already gone.
-		n.adjustClusterSizeAndQuorum()
+		n.adjustClusterSizeAndQuorum(fmt.Sprintf("doRemovePeerAsLeader:%s", peer))
 	}
 	n.Unlock()
 }
@@ -2035,7 +2039,7 @@ func (n *raft) runAsLeader() {
 				n.switchToFollower(noLeader)
 				return
 			}
-			n.trackPeer(vresp.peer)
+			n.trackPeer(vresp.peer, true)
 		case <-n.reqs.ch:
 			// Because of drain() it is possible that we get nil from popOne().
 			n.processVoteRequest(convertVoteRequest(n.reqs.popOne()))
@@ -2079,13 +2083,21 @@ func (n *raft) lostQuorumLocked() bool {
 	}
 
 	now, nc := time.Now().UnixNano(), 1
-	for _, peer := range n.peers {
+	peers := []string{}
+	for pn, peer := range n.peers {
+		peers = append(peers, fmt.Sprintf("\n%s: {%t %d %v}", pn,
+			now-peer.ts < int64(lostQuorumInterval), peer.li, peer.ts))
 		if now-peer.ts < int64(lostQuorumInterval) {
 			nc++
 			if nc >= n.qn {
 				return false
 			}
 		}
+	}
+	if n.scaledown {
+		sort.Strings(peers)
+		fmt.Printf("%s lost quorum  found %d quorum num %d/%d %f %v\n", n.id, nc, n.qn, n.csz,
+			time.Now().Sub(n.scaledownTime).Round(time.Second).Seconds(), peers)
 	}
 	return true
 }
@@ -2369,7 +2381,7 @@ func (n *raft) applyCommit(index uint64) error {
 				lp.kp = true
 			}
 			// Adjust cluster size and quorum if needed.
-			n.adjustClusterSizeAndQuorum()
+			n.adjustClusterSizeAndQuorum(fmt.Sprintf("commit-EntryAddPeer:%s", newPeer))
 			// Write out our new state.
 			n.writePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
 			// We pass these up as well.
@@ -2388,7 +2400,7 @@ func (n *raft) applyCommit(index uint64) error {
 			if _, ok := n.peers[peer]; ok {
 				delete(n.peers, peer)
 				// We should decrease our cluster size since we are tracking this peer.
-				n.adjustClusterSizeAndQuorum()
+				n.adjustClusterSizeAndQuorum(fmt.Sprintf("commit-EntryRemovePeer:%s", peer))
 				// Write out our new state.
 				n.writePeerState(&peerState{n.peerNames(), n.csz, n.extSt})
 			}
@@ -2460,11 +2472,17 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 
 // Used to adjust cluster size and peer count based on added official peers.
 // lock should be held.
-func (n *raft) adjustClusterSizeAndQuorum() {
+func (n *raft) adjustClusterSizeAndQuorum(ctx string) {
 	pcsz, ncsz := n.csz, 0
 	for _, peer := range n.peers {
 		if peer.kp {
 			ncsz++
+		}
+	}
+	if n.scaledown {
+		fmt.Printf("%s %s %s adjustClusterSizeAndQuorum %d->%d %d->%d\n", n.id, ctx, n.group, n.csz, ncsz, n.qn, ncsz/2+1)
+		if n.csz == 3 && ncsz == 4 {
+			debug.PrintStack()
 		}
 	}
 	n.csz = ncsz
@@ -2482,7 +2500,7 @@ func (n *raft) adjustClusterSizeAndQuorum() {
 }
 
 // Track interactions with this peer.
-func (n *raft) trackPeer(peer string) error {
+func (n *raft) trackPeer(peer string, discoverNewPeers bool) error {
 	n.Lock()
 	var needPeerAdd, isRemoved bool
 	if n.removed != nil {
@@ -2491,13 +2509,27 @@ func (n *raft) trackPeer(peer string) error {
 	if n.state == Leader {
 		if lp, ok := n.peers[peer]; !ok || !lp.kp {
 			// Check if this peer had been removed previously.
-			needPeerAdd = !isRemoved
+			needPeerAdd = discoverNewPeers && !isRemoved
 		}
 	}
+	tsd := time.Now().Sub(n.scaledownTime).Round(time.Second).Seconds()
 	if ps := n.peers[peer]; ps != nil {
+		if n.scaledown {
+			fmt.Printf("tkp %s %d/%d %s %f\n", n.id, n.qn, n.csz, peer, tsd)
+		}
 		ps.ts = time.Now().UnixNano()
-	} else if !isRemoved {
+	} else if discoverNewPeers && !isRemoved {
+		if n.scaledown {
+			fmt.Printf("tkp %s %d/%d %s < new %f needPeerAdd %t\n", n.id, n.qn, n.csz, peer, tsd, needPeerAdd)
+
+			debug.PrintStack()
+
+		}
 		n.peers[peer] = &lps{time.Now().UnixNano(), 0, false}
+	} else {
+		if n.scaledown {
+			fmt.Printf("tkp %s %d/%d %s < isRemoved %f\n", n.id, n.qn, n.csz, peer, tsd)
+		}
 	}
 	n.Unlock()
 
@@ -2547,7 +2579,7 @@ func (n *raft) runAsCandidate() {
 
 			if vresp.granted && nterm >= vresp.term {
 				// only track peers that would be our followers
-				n.trackPeer(vresp.peer)
+				n.trackPeer(vresp.peer, true)
 				votes++
 				if n.wonElection(votes) {
 					// Become LEADER if we have won and gotten a quorum with everyone we should hear from.
@@ -2939,6 +2971,12 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 // Lock should be held.
 func (n *raft) processPeerState(ps *peerState) {
 	// Update our version of peers to that of the leader.
+	if n.scaledown {
+		fmt.Printf("%s processPeerState %d->%d %d->%d\n", n.id, n.csz, ps.clusterSize, n.qn, ps.clusterSize/2+1)
+		if n.csz == 3 && ps.clusterSize == 6 {
+			debug.PrintStack()
+		}
+	}
 	n.csz = ps.clusterSize
 	n.qn = n.csz/2 + 1
 
@@ -2958,7 +2996,7 @@ func (n *raft) processPeerState(ps *peerState) {
 
 // Process a response.
 func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
-	n.trackPeer(ar.peer)
+	n.trackPeer(ar.peer, false)
 
 	if ar.success {
 		n.trackResponse(ar)
@@ -3390,7 +3428,7 @@ func (n *raft) processVoteRequest(vr *voteRequest) error {
 	}
 	n.debug("Received a voteRequest %+v", vr)
 
-	if err := n.trackPeer(vr.candidate); err != nil {
+	if err := n.trackPeer(vr.candidate, true); err != nil {
 		return err
 	}
 
@@ -3485,6 +3523,9 @@ func (n *raft) quorumNeeded() int {
 
 // Lock should be held.
 func (n *raft) updateLeadChange(isLeader bool) {
+	if n.scaledown {
+		debug.PrintStack()
+	}
 	// We don't care about values that have not been consumed (transitory states),
 	// so we dequeue any state that is pending and push the new one.
 	for {
