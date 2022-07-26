@@ -1344,6 +1344,8 @@ func (js *jetStream) truncateOldPeers(mset *stream, newPreferred string) {
 		return
 	}
 
+	si, _ := js.srv.nodeToInfo.Load(newPreferred)
+
 	cc, csa := js.cluster, sa.copyGroup()
 	csa.Group.Peers = csa.Group.Peers[len(csa.Group.Peers)-csa.Config.Replicas:]
 	// Now do consumers still needing truncating first here, followed by the owning stream.
@@ -1351,13 +1353,12 @@ func (js *jetStream) truncateOldPeers(mset *stream, newPreferred string) {
 		if r := ca.Config.replicas(csa.Config); r != len(ca.Group.Peers) {
 			cca := ca.copyGroup()
 			cca.Group.Peers = cca.Group.Peers[len(cca.Group.Peers)-r:]
+			cca.Group.Cluster = si.(nodeInfo).cluster
 			cc.meta.ForwardProposal(encodeAddConsumerAssignment(cca))
 		}
 	}
 
-	si, _ := js.srv.nodeToInfo.Load(newPreferred)
 	csa.Group.Cluster = si.(nodeInfo).cluster
-
 	csa.Group.Preferred = newPreferred
 	cc.meta.ForwardProposal(encodeUpdateStreamAssignment(csa))
 }
@@ -3791,6 +3792,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 				} else {
 					// truncate this consumer
 					cca := ca.copyGroup()
+					cca.Group.Cluster = s.ClusterName()
 					cca.Group.Peers = newPeerSet
 					cc.meta.ForwardProposal(encodeAddConsumerAssignment(cca))
 				}

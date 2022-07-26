@@ -2035,7 +2035,7 @@ func (n *raft) runAsLeader() {
 				n.switchToFollower(noLeader)
 				return
 			}
-			n.trackPeer(vresp.peer)
+			n.trackPeer(vresp.peer, true)
 		case <-n.reqs.ch:
 			// Because of drain() it is possible that we get nil from popOne().
 			n.processVoteRequest(convertVoteRequest(n.reqs.popOne()))
@@ -2482,7 +2482,7 @@ func (n *raft) adjustClusterSizeAndQuorum() {
 }
 
 // Track interactions with this peer.
-func (n *raft) trackPeer(peer string) error {
+func (n *raft) trackPeer(peer string, discoverNewPeers bool) error {
 	n.Lock()
 	var needPeerAdd, isRemoved bool
 	if n.removed != nil {
@@ -2491,12 +2491,12 @@ func (n *raft) trackPeer(peer string) error {
 	if n.state == Leader {
 		if lp, ok := n.peers[peer]; !ok || !lp.kp {
 			// Check if this peer had been removed previously.
-			needPeerAdd = !isRemoved
+			needPeerAdd = discoverNewPeers && !isRemoved
 		}
 	}
 	if ps := n.peers[peer]; ps != nil {
 		ps.ts = time.Now().UnixNano()
-	} else if !isRemoved {
+	} else if discoverNewPeers && !isRemoved {
 		n.peers[peer] = &lps{time.Now().UnixNano(), 0, false}
 	}
 	n.Unlock()
@@ -2547,7 +2547,7 @@ func (n *raft) runAsCandidate() {
 
 			if vresp.granted && nterm >= vresp.term {
 				// only track peers that would be our followers
-				n.trackPeer(vresp.peer)
+				n.trackPeer(vresp.peer, true)
 				votes++
 				if n.wonElection(votes) {
 					// Become LEADER if we have won and gotten a quorum with everyone we should hear from.
@@ -2958,7 +2958,7 @@ func (n *raft) processPeerState(ps *peerState) {
 
 // Process a response.
 func (n *raft) processAppendEntryResponse(ar *appendEntryResponse) {
-	n.trackPeer(ar.peer)
+	n.trackPeer(ar.peer, false)
 
 	if ar.success {
 		n.trackResponse(ar)
@@ -3390,7 +3390,7 @@ func (n *raft) processVoteRequest(vr *voteRequest) error {
 	}
 	n.debug("Received a voteRequest %+v", vr)
 
-	if err := n.trackPeer(vr.candidate); err != nil {
+	if err := n.trackPeer(vr.candidate, true); err != nil {
 		return err
 	}
 
